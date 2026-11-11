@@ -1,0 +1,271 @@
+#!/usr/bin/env bash
+#
+# tile-toggle-steam - control how the Steam client opens in Hyprland / Omarchy
+#
+# Omarchy ships rules that make every Steam window float, with the main client
+# opening at 1100x700, centered and the Friends List at 460x800. This script
+# keeps a small override module in ~/.config/hypr/steam.lua and toggles the main
+# window and Friends List between tiled (like most apps) and Omarchy's floating
+# default.
+#
+# Dialogs and the login window are left alone so they keep opening as floating
+# panels.
+#
+set -euo pipefail
+
+readonly SCRIPT_NAME="${0##*/}"
+readonly CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/hypr"
+readonly MAIN_CONFIG="$CONFIG_DIR/hyprland.lua"
+readonly MODULE="$CONFIG_DIR/steam.lua"
+readonly REQUIRE_LINE='require("hypr.steam")'
+readonly MARKER='-- Added by tile-toggle-steam'
+readonly MAIN_TITLE='Steam'
+readonly FRIENDS_TITLE='Friends List'
+readonly FLOAT_WIDTH=1100
+readonly FLOAT_HEIGHT=700
+readonly FRIENDS_WIDTH=460
+readonly FRIENDS_HEIGHT=800
+
+die() {
+  printf '%s: %s\n' "$SCRIPT_NAME" "$*" >&2
+  exit 1
+}
+
+usage() {
+  cat <<EOF
+Usage: $SCRIPT_NAME [command]
+
+Control how the Steam window opens in Hyprland.
+
+Commands:
+  toggle      Switch between tiled and floating (default)
+  tile        Open the main window and Friends List tiled, like most apps
+  float       Restore Omarchy's floating defaults (main 1100x700 centered,
+              Friends List 460x800)
+  status      Show the saved setting and any running Steam windows
+  uninstall   Remove the override and return to Omarchy's default
+  help        Show this help
+
+The main Steam window and Friends List are affected. Dialogs and the login
+window keep floating. The setting is saved in $MODULE
+and loaded from $MAIN_CONFIG.
+EOF
+}
+
+hyprland_running() {
+  hyprctl version >/dev/null 2>&1
+}
+
+current_mode() {
+  if [[ -f $MODULE ]] && grep -q 'tile = true' "$MODULE"; then
+    echo tile
+  else
+    echo float
+  fi
+}
+
+steam_clients() {
+  command -v jq >/dev/null || return 0
+  hyprctl clients -j 2>/dev/null |
+    jq -r '.[]
+      | select((.class // "") | ascii_downcase == "steam")
+      | [.address, .title, .floating, "\(.size[0])x\(.size[1])"]
+      | @tsv' || true
+}
+
+tiled_steam_windows() {
+  local clients
+  clients=$(steam_clients)
+  [[ -n $clients ]] || return 0
+  while IFS=$'\t' read -r address title _ _; do
+    case $title in
+      "$MAIN_TITLE" | "$FRIENDS_TITLE") printf '%s\t%s\n' "$address" "$title" ;;
+    esac
+  done <<<"$clients"
+}
+
+check_errors() {
+  local errors
+  errors=$(hyprctl configerrors)
+  if [[ -n $errors ]]; then
+    printf 'Hyprland reported config errors:\n%s\n' "$errors" >&2
+    exit 1
+  fi
+}
+
+reload_hyprland() {
+  hyprctl reload >/dev/null
+  # Let the compositor finish re-applying rules to open windows before we
+  # dispatch the live update, otherwise the reload can undo it.
+  sleep 0.25
+  check_errors
+}
+
+write_module() {
+  local mode=$1
+  mkdir -p "$CONFIG_DIR"
+
+  if [[ $mode == tile ]]; then
+    cat >"$MODULE" <<'LUA'
+-- Managed by Tile-Toggle-Steam.
+-- The main Steam window and Friends List open tiled, like most apps.
+-- Run `tile-toggle-steam float` to undo.
+o.window({ class = "steam", title = "^(Steam|Friends List)$" }, { tile = true })
+LUA
+  else
+    cat >"$MODULE" <<'LUA'
+-- Managed by Tile-Toggle-Steam.
+-- Mode: float. Omarchy's stock rules apply (main window 1100x700, centered;
+-- Friends List 460x800). Run `tile-toggle-steam tile` to make them open tiled.
+LUA
+  fi
+}
+
+ensure_module_loaded() {
+  [[ -f $MAIN_CONFIG ]] || die "cannot find $MAIN_CONFIG"
+
+  if grep -qF "$REQUIRE_LINE" "$MAIN_CONFIG"; then
+    return 0
+  fi
+
+  cp "$MAIN_CONFIG" "$MAIN_CONFIG.bak.$(date +%Y%m%d-%H%M%S)"
+  printf '\n%s\n%s\n' "$MARKER" "$REQUIRE_LINE" >>"$MAIN_CONFIG"
+  printf 'Added %s to %s\n' "$REQUIRE_LINE" "$MAIN_CONFIG"
+}
+
+apply_live() {
+  local mode=$1 action
+  if [[ $mode == tile ]]; then
+    action=off
+  else
+    action=on
+  fi
+
+  local windows
+  windows=$(tiled_steam_windows)
+  [[ -n $windows ]] || return 0
+
+  local address title width height
+  while IFS=$'\t' read -r address title; do
+    hyprctl eval "hl.dispatch(hl.dsp.window.float({ action = \"$action\", window = \"address:$address\" }))" >/dev/null || true
+
+    if [[ $mode == float ]]; then
+      if [[ $title == "$FRIENDS_TITLE" ]]; then
+        width=$FRIENDS_WIDTH
+        height=$FRIENDS_HEIGHT
+      else
+        width=$FLOAT_WIDTH
+        height=$FLOAT_HEIGHT
+      fi
+
+      hyprctl eval "hl.dispatch(hl.dsp.window.resize({ window = \"address:$address\", x = $width, y = $height, relative = false }))" >/dev/null || true
+
+      # Omarchy centers the main window but only sizes the Friends List.
+      if [[ $title == "$MAIN_TITLE" ]]; then
+        hyprctl eval "hl.dispatch(hl.dsp.window.center({ window = \"address:$address\" }))" >/dev/null || true
+      fi
+    fi
+  done <<<"$windows"
+}
+
+set_mode() {
+  local mode=$1 label
+  if [[ $mode == tile ]]; then
+    label=tiled
+  else
+    label=floating
+  fi
+
+  write_module "$mode"
+  ensure_module_loaded
+
+  if hyprland_running; then
+    reload_hyprland
+    apply_live "$mode"
+  else
+    printf 'Hyprland is not running; the setting will apply next time it starts.\n'
+  fi
+
+  printf 'The main Steam window and Friends List will now open %s.\n' "$label"
+}
+
+cmd_status() {
+  local mode loaded=no
+  mode=$(current_mode)
+  if grep -qF "$REQUIRE_LINE" "$MAIN_CONFIG" 2>/dev/null; then
+    loaded=yes
+  fi
+
+  printf 'Setting: %s\n' "$mode"
+  if [[ $mode == tile && $loaded == no ]]; then
+    printf 'Module:  not loaded (run "%s tile" to reinstall it)\n' "$SCRIPT_NAME"
+  fi
+
+  if ! hyprland_running; then
+    printf 'Hyprland: not running\n'
+    return 0
+  fi
+
+  if ! command -v jq >/dev/null; then
+    printf 'jq not found; cannot inspect open windows\n'
+    return 0
+  fi
+
+  local clients
+  clients=$(steam_clients)
+  if [[ -z $clients ]]; then
+    printf 'Steam: not running\n'
+    return 0
+  fi
+
+  printf 'Steam windows:\n'
+  while IFS=$'\t' read -r address title floating size; do
+    printf '  %-20s %s  floating=%s  size=%s\n' "$title" "$address" "$floating" "$size"
+  done <<<"$clients"
+}
+
+cmd_uninstall() {
+  if [[ -f $MAIN_CONFIG ]] && grep -qF "$REQUIRE_LINE" "$MAIN_CONFIG"; then
+    cp "$MAIN_CONFIG" "$MAIN_CONFIG.bak.$(date +%Y%m%d-%H%M%S)"
+    if grep -v -F -e "$MARKER" -e "$REQUIRE_LINE" "$MAIN_CONFIG" >"$MAIN_CONFIG.tmp"; then
+      mv "$MAIN_CONFIG.tmp" "$MAIN_CONFIG"
+    else
+      rm -f "$MAIN_CONFIG.tmp"
+      die "could not update $MAIN_CONFIG"
+    fi
+  fi
+
+  rm -f "$MODULE"
+
+  if hyprland_running; then
+    reload_hyprland
+    apply_live float
+  fi
+
+  printf "Removed the Steam override. Omarchy's floating default is back.\n"
+}
+
+main() {
+  local command=${1:-toggle}
+
+  case $command in
+    toggle)
+      if [[ $(current_mode) == tile ]]; then
+        set_mode float
+      else
+        set_mode tile
+      fi
+      ;;
+    tile) set_mode tile ;;
+    float) set_mode float ;;
+    status) cmd_status ;;
+    uninstall) cmd_uninstall ;;
+    help | -h | --help) usage ;;
+    *)
+      usage >&2
+      exit 2
+      ;;
+  esac
+}
+
+main "$@"
